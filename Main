@@ -1,1 +1,168 @@
+###############################
+# QUESTION 2 R STOCK TRACKER
+# Part i–iii
+###############################
 
+BASE_DATE <- as.Date("2024-03-18")
+
+TICKERS <- c(
+  "AIF","BAR","BIO","BIT",
+  "CLY","HAS","HEA","INY",
+  "MOR","OUB","PRO","QIO"
+)
+
+rolling_mean <- function(x, n) {
+  out <- rep(NA_real_, length(x))
+  if (length(x) < n) return(out)
+  
+  for (i in n:length(x)) {
+    out[i] <- mean(x[(i - n + 1):i], na.rm = TRUE)
+  }
+  out
+}
+
+ema <- function(x, n) {
+  out <- rep(NA_real_, length(x))
+  k <- 2 / (n + 1)
+  
+  first_valid <- which(!is.na(x))[1]
+  if (is.na(first_valid)) return(out)
+  
+  out[first_valid] <- x[first_valid]
+  
+  if (first_valid < length(x)) {
+    for (i in (first_valid + 1):length(x)) {
+      out[i] <- x[i] * k + out[i - 1] * (1 - k)
+    }
+  }
+  out
+}
+
+parse_feed_line <- function(line) {
+  date_match <- regmatches(line, regexpr("\\d{2}/\\d{2}/\\d{4}", line))
+  if (length(date_match) == 0) return(NULL)
+  
+  date_val <- as.Date(date_match, "%d/%m/%Y")
+  
+  pairs <- regmatches(line, gregexpr("[A-Z]{3}:[0-9]+\\.[0-9]{2}", line))[[1]]
+  if (length(pairs) == 0) return(NULL)
+  
+  prices <- setNames(
+    as.numeric(sub(".*:", "", pairs)),
+    sub(":.*", "", pairs)
+  )
+  
+  list(date = date_val, prices = prices)
+}
+
+parse_feed_file <- function(filepath) {
+  lines <- readLines(filepath, warn = FALSE)
+  parsed <- lapply(lines, parse_feed_line)
+  Filter(Negate(is.null), parsed)
+}
+
+build_historic_df <- function(filepath) {
+  parsed <- parse_feed_file(filepath)
+  
+  rows <- lapply(parsed, function(rec) {
+    row <- as.list(rec$prices[TICKERS])
+    names(row) <- TICKERS
+    row$Date <- rec$date
+    as.data.frame(row, stringsAsFactors = FALSE)
+  })
+  
+  df <- do.call(rbind, rows)
+  df <- df[, c("Date", TICKERS)]
+  df <- df[order(df$Date), ]
+  rownames(df) <- NULL
+  
+  for (ticker in TICKERS) {
+    df[[ticker]] <- as.numeric(df[[ticker]])
+  }
+  
+  df
+}
+
+load_company_info <- function(filepath) {
+  info <- read.csv(filepath, stringsAsFactors = FALSE)
+  
+  names(info) <- c(
+    "company_name",
+    "ticker",
+    "industry",
+    "shares_in_issue"
+  )
+  
+  info$shares_in_issue <- as.numeric(info$shares_in_issue)
+  info
+}
+
+compute_vw_index <- function(df, tickers, shares_vec) {
+  caps <- rowSums(
+    sweep(as.matrix(df[, tickers]), 2, shares_vec[tickers], `*`)
+  )
+  
+  base_row <- match(BASE_DATE, df$Date)
+  if (is.na(base_row)) stop("Base date missing.")
+  
+  round(caps / caps[base_row] * 100, 4)
+}
+
+rebuild_indices <- function(main_df, info) {
+  tickers <- intersect(info$ticker, names(main_df))
+  shares_vec <- setNames(info$shares_in_issue, info$ticker)
+  
+  main_df$VW_Index <- compute_vw_index(main_df, tickers, shares_vec)
+  
+  industries <- split(info$ticker, info$industry)
+  
+  industry_dfs <- lapply(industries, function(tks) {
+    sub_df <- main_df[, c("Date", tks, "VW_Index")]
+    sub_df$Industry_Index <- compute_vw_index(sub_df, tks, shares_vec)
+    sub_df
+  })
+  
+  list(main_df = main_df, industry_dfs = industry_dfs)
+}
+
+save_data_frames <- function(main_df, industry_dfs, folder = "saved_data") {
+  if (!dir.exists(folder)) dir.create(folder)
+  
+  saveRDS(main_df, file.path(folder, "main_df.rds"))
+  
+  for (ind in names(industry_dfs)) {
+    saveRDS(industry_dfs[[ind]], file.path(folder, paste0("industry_", ind, ".rds")))
+  }
+}
+
+build_company_dfs <- function(main_df, industry_dfs, info) {
+  company_list <- list()
+  
+  for (ticker in info$ticker) {
+    if (!(ticker %in% names(main_df))) next
+    
+    ind <- info$industry[info$ticker == ticker]
+    price <- main_df[[ticker]]
+    
+    company_list[[ticker]] <- data.frame(
+      Date = main_df$Date,
+      Price = price,
+      VW_Index = main_df$VW_Index,
+      Industry_Index = industry_dfs[[ind]]$Industry_Index,
+      MA10 = rolling_mean(price, 10),
+      MA50 = rolling_mean(price, 50),
+      MA200 = rolling_mean(price, 200),
+      EMA10 = ema(price, 10)
+    )
+  }
+  
+  company_list
+}
+
+save_company_dfs <- function(company_list, folder = "company_data") {
+  if (!dir.exists(folder)) dir.create(folder)
+  
+  for (ticker in names(company_list)) {
+    saveRDS(company_list[[ticker]], file.path(folder, paste0(ticker, ".rds")))
+  }
+}
