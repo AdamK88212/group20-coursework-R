@@ -1,168 +1,283 @@
-###############################
-# QUESTION 2 R STOCK TRACKER
-# Part i–iii
-###############################
+#####################################################
+# Part iv — Share s3 object & Company summary print
+#####################################################
 
-BASE_DATE <- as.Date("2024-03-18")
-
-TICKERS <- c(
-  "AIF","BAR","BIO","BIT",
-  "CLY","HAS","HEA","INY",
-  "MOR","OUB","PRO","QIO"
-)
-
-rolling_mean <- function(x, n) {
-  out <- rep(NA_real_, length(x))
-  if (length(x) < n) return(out)
+make_share <- function(ticker, company_list, info) {
+  df <- company_list[[ticker]]
+  ci <- info[info$ticker == ticker, ]
   
-  for (i in n:length(x)) {
-    out[i] <- mean(x[(i - n + 1):i], na.rm = TRUE)
+  last_non_na <- function(x) {
+    vals <- x[!is.na(x)]
+    if (length(vals) == 0) return(NA)
+    tail(vals, 1)
   }
-  out
+  
+  win <- tail(df$Price, 252)
+  
+  structure(
+    list(
+      ticker = ticker,
+      company_name = ci$company_name,
+      industry = ci$industry,
+      current_price = tail(df$Price, 1),
+      high_52wk = max(win, na.rm = TRUE),
+      low_52wk = min(win, na.rm = TRUE),
+      ma10 = last_non_na(df$MA10),
+      ma50 = last_non_na(df$MA50),
+      ma200 = last_non_na(df$MA200),
+      last_updated = tail(df$Date, 1)
+    ),
+    class = "share"
+  )
 }
 
-ema <- function(x, n) {
-  out <- rep(NA_real_, length(x))
-  k <- 2 / (n + 1)
+print.share <- function(x, ...) {
+  cat("================================\n")
+  cat("Ticker:", x$ticker, "\n")
+  cat("Company:", x$company_name, "\n")
+  cat("Industry:", x$industry, "\n")
+  cat("Current Price:", round(x$current_price, 2), "\n")
+  cat("52 Week High:", round(x$high_52wk, 2), "\n")
+  cat("52 Week Low:", round(x$low_52wk, 2), "\n")
+  cat("Current 10 day MA:", round(x$ma10, 2), "\n")
+  cat("Current 50 day MA:", round(x$ma50, 2), "\n")
+  cat("Current 200 day MA:", round(x$ma200, 2), "\n")
+  cat("Updated:", as.character(x$last_updated), "\n")
+  cat("================================\n")
+}
+
+build_shares_list <- function(company_list, info) {
+  shares <- lapply(info$ticker, function(tkr) {
+    make_share(tkr, company_list, info)
+  })
   
-  first_valid <- which(!is.na(x))[1]
-  if (is.na(first_valid)) return(out)
+  names(shares) <- info$ticker
+  shares
+}
+
+#########################################
+# part V — weekly feed update function
+#########################################
+
+update_feed <- function(weekly_file, company_file) {
+  old_df <- readRDS("saved_data/main_df.rds")
+  new_df <- build_historic_df(weekly_file)
   
-  out[first_valid] <- x[first_valid]
+  combined <- rbind(old_df[, names(new_df)], new_df)
+  combined <- combined[!duplicated(combined$Date), ]
+  combined <- combined[order(combined$Date), ]
   
-  if (first_valid < length(x)) {
-    for (i in (first_valid + 1):length(x)) {
-      out[i] <- x[i] * k + out[i - 1] * (1 - k)
+  info <- load_company_info(company_file)
+  res <- rebuild_indices(combined, info)
+  
+  save_data_frames(res$main_df, res$industry_dfs)
+  
+  company_list <- build_company_dfs(
+    res$main_df,
+    res$industry_dfs,
+    info
+  )
+  
+  save_company_dfs(company_list)
+  
+  invisible(res$main_df)
+}
+
+#################################
+# part vi — portfolio s3 object
+#################################
+
+lookup_price <- function(ticker, date, company_list) {
+  date <- as.Date(date)
+  df <- company_list[[ticker]]
+  idx <- which(df$Date == date)
+  
+  if (length(idx) == 0)
+    stop("No price available for this date.")
+  
+  df$Price[idx[1]]
+}
+
+create_portfolio <- function(ticker, date, shares, company_list) {
+  date <- as.Date(date)
+  
+  price_row <- company_list[[ticker]]
+  price <- price_row$Price[price_row$Date == date]
+  
+  pf <- list(
+    transactions = data.frame(
+      ticker = ticker,
+      type = "BUY",
+      shares = shares,
+      price = price,
+      purchase_price = NA,
+      realized_pl = NA,
+      date = date,
+      stringsAsFactors = FALSE
+    ),
+    company_list = company_list
+  )
+  
+  class(pf) <- "portfolio"
+  saveRDS(pf, "portfolio.rds")
+  pf
+}
+
+buy_shares <- function(pf, ticker, date, shares) {
+  date <- as.Date(date)
+  
+  price_row <- pf$company_list[[ticker]]
+  price <- price_row$Price[price_row$Date == date]
+  
+  new_tx <- data.frame(
+    ticker = ticker,
+    type = "BUY",
+    shares = shares,
+    price = price,
+    purchase_price = NA,
+    realized_pl = NA,
+    date = date,
+    stringsAsFactors = FALSE
+  )
+  
+  pf$transactions <- rbind(pf$transactions, new_tx)
+  saveRDS(pf, "portfolio.rds")
+  pf
+}
+
+sell_shares <- function(pf, ticker, date, shares) {
+  date <- as.Date(date)
+  
+  holdings <- portfolio_summary(pf)
+  
+  if (!(ticker %in% names(holdings))) {
+    stop("No shares currently held in this ticker")
+  }
+  
+  holding <- holdings[[ticker]]
+  
+  if (shares > holding$shares) {
+    stop("Cannot sell more shares than currently held")
+  }
+  
+  price <- lookup_price(ticker, date, pf$company_list)
+  realized_pl <- (price - holding$avg_price) * shares
+  
+  new_tx <- data.frame(
+    ticker = ticker,
+    type = "SELL",
+    shares = shares,
+    price = price,
+    purchase_price = holding$avg_price,
+    realized_pl = realized_pl,
+    date = date,
+    stringsAsFactors = FALSE
+  )
+  
+  pf$transactions <- rbind(pf$transactions, new_tx)
+  saveRDS(pf, "portfolio.rds")
+  pf
+}
+
+portfolio_summary <- function(pf) {
+  tx <- pf$transactions
+  tickers <- unique(tx$ticker)
+  
+  holdings <- list()
+  
+  for (ticker in tickers) {
+    sub <- tx[tx$ticker == ticker, ]
+    sub <- sub[order(sub$date), ]
+    
+    shares_held <- 0
+    avg_price <- 0
+    
+    for (i in seq_len(nrow(sub))) {
+      row <- sub[i, ]
+      
+      if (row$type == "BUY") {
+        total_cost <- shares_held * avg_price + row$shares * row$price
+        shares_held <- shares_held + row$shares
+        
+        if (shares_held > 0) {
+          avg_price <- total_cost / shares_held
+        } else {
+          avg_price <- 0
+        }
+      }
+      
+      if (row$type == "SELL") {
+        shares_held <- shares_held - row$shares
+        
+        if (shares_held == 0) {
+          avg_price <- 0
+        }
+      }
+    }
+    
+    if (shares_held > 0) {
+      current_price <- tail(pf$company_list[[ticker]]$Price, 1)
+      
+      holdings[[ticker]] <- list(
+        shares = shares_held,
+        avg_price = avg_price,
+        current_value = shares_held * current_price,
+        profit_loss = (current_price - avg_price) * shares_held
+      )
     }
   }
-  out
+  
+  holdings
 }
 
-parse_feed_line <- function(line) {
-  date_match <- regmatches(line, regexpr("\\d{2}/\\d{2}/\\d{4}", line))
-  if (length(date_match) == 0) return(NULL)
+print.portfolio <- function(x, ...) {
+  cat("\n========== PORTFOLIO ==========\n")
   
-  date_val <- as.Date(date_match, "%d/%m/%Y")
+  sales <- x$transactions[x$transactions$type == "SELL", ]
   
-  pairs <- regmatches(line, gregexpr("[A-Z]{3}:[0-9]+\\.[0-9]{2}", line))[[1]]
-  if (length(pairs) == 0) return(NULL)
-  
-  prices <- setNames(
-    as.numeric(sub(".*:", "", pairs)),
-    sub(":.*", "", pairs)
-  )
-  
-  list(date = date_val, prices = prices)
-}
-
-parse_feed_file <- function(filepath) {
-  lines <- readLines(filepath, warn = FALSE)
-  parsed <- lapply(lines, parse_feed_line)
-  Filter(Negate(is.null), parsed)
-}
-
-build_historic_df <- function(filepath) {
-  parsed <- parse_feed_file(filepath)
-  
-  rows <- lapply(parsed, function(rec) {
-    row <- as.list(rec$prices[TICKERS])
-    names(row) <- TICKERS
-    row$Date <- rec$date
-    as.data.frame(row, stringsAsFactors = FALSE)
-  })
-  
-  df <- do.call(rbind, rows)
-  df <- df[, c("Date", TICKERS)]
-  df <- df[order(df$Date), ]
-  rownames(df) <- NULL
-  
-  for (ticker in TICKERS) {
-    df[[ticker]] <- as.numeric(df[[ticker]])
+  cat("\nCompleted Sales\n")
+  if (nrow(sales) == 0) {
+    cat("No completed sales\n")
+  } else {
+    for (i in seq_len(nrow(sales))) {
+      row <- sales[i, ]
+      
+      cat(
+        row$ticker,
+        "| Purchase:", round(row$purchase_price, 2),
+        "| Sold:", round(row$price, 2),
+        "| Date:", as.character(row$date),
+        "| Realized P/L:", round(row$realized_pl, 2),
+        "\n"
+      )
+    }
   }
   
-  df
-}
-
-load_company_info <- function(filepath) {
-  info <- read.csv(filepath, stringsAsFactors = FALSE)
+  cat("\nCurrent Holdings\n")
+  holdings <- portfolio_summary(x)
   
-  names(info) <- c(
-    "company_name",
-    "ticker",
-    "industry",
-    "shares_in_issue"
-  )
-  
-  info$shares_in_issue <- as.numeric(info$shares_in_issue)
-  info
-}
-
-compute_vw_index <- function(df, tickers, shares_vec) {
-  caps <- rowSums(
-    sweep(as.matrix(df[, tickers]), 2, shares_vec[tickers], `*`)
-  )
-  
-  base_row <- match(BASE_DATE, df$Date)
-  if (is.na(base_row)) stop("Base date missing.")
-  
-  round(caps / caps[base_row] * 100, 4)
-}
-
-rebuild_indices <- function(main_df, info) {
-  tickers <- intersect(info$ticker, names(main_df))
-  shares_vec <- setNames(info$shares_in_issue, info$ticker)
-  
-  main_df$VW_Index <- compute_vw_index(main_df, tickers, shares_vec)
-  
-  industries <- split(info$ticker, info$industry)
-  
-  industry_dfs <- lapply(industries, function(tks) {
-    sub_df <- main_df[, c("Date", tks, "VW_Index")]
-    sub_df$Industry_Index <- compute_vw_index(sub_df, tks, shares_vec)
-    sub_df
-  })
-  
-  list(main_df = main_df, industry_dfs = industry_dfs)
-}
-
-save_data_frames <- function(main_df, industry_dfs, folder = "saved_data") {
-  if (!dir.exists(folder)) dir.create(folder)
-  
-  saveRDS(main_df, file.path(folder, "main_df.rds"))
-  
-  for (ind in names(industry_dfs)) {
-    saveRDS(industry_dfs[[ind]], file.path(folder, paste0("industry_", ind, ".rds")))
-  }
-}
-
-build_company_dfs <- function(main_df, industry_dfs, info) {
-  company_list <- list()
-  
-  for (ticker in info$ticker) {
-    if (!(ticker %in% names(main_df))) next
-    
-    ind <- info$industry[info$ticker == ticker]
-    price <- main_df[[ticker]]
-    
-    company_list[[ticker]] <- data.frame(
-      Date = main_df$Date,
-      Price = price,
-      VW_Index = main_df$VW_Index,
-      Industry_Index = industry_dfs[[ind]]$Industry_Index,
-      MA10 = rolling_mean(price, 10),
-      MA50 = rolling_mean(price, 50),
-      MA200 = rolling_mean(price, 200),
-      EMA10 = ema(price, 10)
-    )
+  if (length(holdings) == 0) {
+    cat("No current holdings\n")
+  } else {
+    for (ticker in names(holdings)) {
+      item <- holdings[[ticker]]
+      
+      cat(
+        ticker,
+        "| Shares:", item$shares,
+        "| Purchase:", round(item$avg_price, 2),
+        "| Value:", round(item$current_value, 2),
+        "| P/L:", round(item$profit_loss, 2),
+        "\n"
+      )
+    }
   }
   
-  company_list
+  cat("===============================\n")
 }
 
-save_company_dfs <- function(company_list, folder = "company_data") {
-  if (!dir.exists(folder)) dir.create(folder)
-  
-  for (ticker in names(company_list)) {
-    saveRDS(company_list[[ticker]], file.path(folder, paste0(ticker, ".rds")))
-  }
+refresh_portfolio <- function(filepath = "portfolio.rds") {
+  pf <- readRDS(filepath)
+  print(pf)
+  invisible(pf)
 }
