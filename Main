@@ -166,3 +166,66 @@ save_company_dfs <- function(company_list, folder = "company_data") {
     saveRDS(company_list[[ticker]], file.path(folder, paste0(ticker, ".rds")))
   }
 }
+#####################################################
+# Part iv — Share s3 object & portfolio
+#####################################################
+
+make_share <- function(ticker, company_list, info) {
+  df <- company_list[[ticker]]
+  ci <- info[info$ticker == ticker, ]
+  
+  last_non_na <- function(x) {
+    vals <- x[!is.na(x)]
+    if (length(vals) == 0) return(NA)
+    tail(vals, 1)
+  }
+  
+  win <- tail(df$Price, 252)
+  
+  structure(
+    list(
+      ticker = ticker,
+      company_name = ci$company_name,
+      industry = ci$industry,
+      current_price = tail(df$price, 1),
+      high_52wk = max(win, na.rm = TRUE),
+      low_52wk = min(win, na.rm = TRUE),
+      ma10 = last_non_na(df$MA10),
+      ma50 = last_non_na(df$MA50),
+      ma200 = last_non_na(df$MA200),
+      last_updated = tail(df$Date, 1)
+    ),
+    class = "share"
+  )
+}
+
+lookup_price <- function(ticker, date, company_list) {
+  df <- company_list[[ticker]]
+  idx <- which(df$Date == date)
+  
+  if (length(idx) == 0)
+    stop("No price available for this date.")
+  
+  df$Price[idx[1]]
+}
+
+build_company_dfs <- function(main_df, industry_dfs, info) {
+  company_list <- list()
+  
+  for (ticker in info$ticker) {
+    ind <- info$industry[info$ticker == ticker]
+    
+    company_list[[ticker]] <- data.frame(
+      Date = main_df$Date,
+      Price = main_df[[ticker]],
+      Industry_Index = industry_dfs[ind]$Industry_Index
+    )
+  }
+  
+  company_list
+}
+
+refresh_portfolio <- function(filepath = "portfolio.rds") {
+  pf <- readRDS(filepath)
+  print(pf)
+}
